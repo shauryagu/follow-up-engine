@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from robby import outbox as outbox_mod
-from robby.draft import render_v1
+from robby.draft import render_v1, summarize_contact
 
 COOLDOWN_HOURS = 48
 
@@ -79,6 +79,7 @@ def generate_draft(
     *,
     reason: str = "quiet_open",
     complete=None,
+    on_chunk=None,
 ) -> dict:
     quote = conn.execute("SELECT * FROM quotes WHERE id = ?", (primary_quote_id,)).fetchone()
     if quote is None or quote["status"] != "open":
@@ -92,6 +93,15 @@ def generate_draft(
         {"id": row["id"], "amount": row["amount"], "status": row["status"]}
         for row in open_rows
     ]
+    event_rows = conn.execute(
+        "SELECT type, timestamp FROM events WHERE quote_id = ? AND timestamp <= ?",
+        (primary_quote_id, now),
+    ).fetchall()
+    contact = summarize_contact(
+        last_contact_at=quote["last_contact_at"],
+        events=event_rows,
+        now=now,
+    )
     body = render_v1(
         customer_name=quote["customer_name"],
         tech_name=quote["tech_name"],
@@ -100,6 +110,8 @@ def generate_draft(
         open_quotes=open_quotes,
         now=now,
         complete=complete,
+        contact=contact,
+        on_chunk=on_chunk,
     )
     message_id = str(uuid.uuid4())
     idempotency_key = str(uuid.uuid4())

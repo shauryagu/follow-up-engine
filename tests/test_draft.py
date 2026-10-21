@@ -2,8 +2,8 @@ import pytest
 
 from robby.attempts import generate_draft
 from robby.db import connect
-from robby.draft import first_name, render_v1, template_body
-from robby.ingest import ingest_quotes
+from robby.draft import DraftGenerationError, first_name, render_v1, template_body
+from robby.ingest import ingest_events, ingest_quotes
 
 PHONE = "+19175552003"
 NOW = "2026-08-10T00:00:00Z"
@@ -80,6 +80,99 @@ def test_generate_draft_complete_hook_stores_llm_sms_as_revision_v1():
     assert rev["version"] == 1
     assert rev["body"] == "LLM SMS"
     assert rev["author"] == "engine"
+
+
+def test_prompt_omits_phone_and_last_name():
+    captured = {}
+
+    def complete(prompt):
+        captured["prompt"] = prompt
+        return "Hi Karen — checking in on the quote."
+
+    render_v1(now=NOW, complete=complete, **TEMPLATE_KW)
+    prompt = captured["prompt"]
+    assert PHONE not in prompt
+    assert "Nguyen" not in prompt
+    assert "Karen" in prompt
+    assert "first follow-up" in prompt.lower() or "first follow up" in prompt.lower()
+
+
+def test_prompt_references_prior_contact_not_first_touch():
+    captured = {}
+
+    def complete(prompt):
+        captured["prompt"] = prompt
+        return "Following up on my last note."
+
+    render_v1(
+        now=NOW,
+        complete=complete,
+        contact={
+            "prior_contact": True,
+            "last_outbound": "2026-08-08T12:00:00Z",
+            "last_reply": None,
+            "last_view": "2026-08-09T00:00:00Z",
+        },
+        **TEMPLATE_KW,
+    )
+    prompt = captured["prompt"].lower()
+    assert "already" in prompt or "prior" in prompt
+    assert "this is a first follow-up" not in prompt
+    assert PHONE not in captured["prompt"]
+
+
+def test_on_chunk_receives_text_and_generate_saves_only_after_complete():
+    chunks = []
+    conn = _conn_with(_quote())
+
+    def complete(prompt):
+        assert conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"] == 0
+        return "Saved after stream"
+
+    draft = generate_draft(
+        conn,
+        "Q-1003",
+        NOW,
+        complete=complete,
+        on_chunk=chunks.append,
+    )
+    assert chunks == ["Saved after stream"]
+    assert draft["body"] == "Saved after stream"
+    assert conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"] == 1
+
+
+def test_model_failure_does_not_save_and_asks_to_retry():
+    conn = _conn_with(_quote())
+
+    def complete(prompt):
+        raise RuntimeError("connection reset")
+
+    with pytest.raises(DraftGenerationError, match="try again"):
+        generate_draft(conn, "Q-1003", NOW, complete=complete)
+    assert conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"] == 0
+
+
+def test_generate_draft_uses_events_as_prior_contact():
+    captured = {}
+
+    def complete(prompt):
+        captured["prompt"] = prompt
+        return "Checking back as promised."
+
+    conn = _conn_with(_quote(last_contact_at="2026-08-08T12:00:00Z"))
+    ingest_events(
+        conn,
+        [
+            {
+                "event_id": "e1",
+                "quote_id": "Q-1003",
+                "type": "message_sent",
+                "timestamp": "2026-08-08T12:00:00Z",
+            }
+        ],
+    )
+    generate_draft(conn, "Q-1003", NOW, complete=complete)
+    assert "already" in captured["prompt"].lower() or "prior" in captured["prompt"].lower()
 
 
 def test_generate_draft_omits_accepted_sibling():
