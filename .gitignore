@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 data/
 *.sqlite
+.env
 .superpowers/
 .worktrees/
 .serena/
