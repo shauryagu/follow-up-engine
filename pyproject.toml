@@ -5,6 +5,10 @@ requires-python = ">=3.10"
 dependencies = [
     "openai",
     "python-dotenv",
+    "fastapi",
+    "jinja2",
+    "uvicorn",
+    "httpx",
 ]
 
 [tool.pytest.ini_options]

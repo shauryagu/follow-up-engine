@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ copy.title }}{% endblock %}
+{% block body %}
+<p><a class="back" href="/?now={{ now | urlencode }}">Back to quotes</a></p>
+<p class="clock">{{ now_label }} · {{ writer }}</p>
+<h1>{{ copy.title }}</h1>
+<p class="lede">{{ copy.lede }}</p>
+<div class="card">
+  <ol class="rank-points">
+    <li>
+      <h2>Ticket size</h2>
+      <p>{{ copy.size }}</p>
+    </li>
+    <li>
+      <h2>Urgency</h2>
+      <p>{{ copy.urgency }}</p>
+    </li>
+    <li>
+      <h2>Recent views</h2>
+      <p>{{ copy.views }}</p>
+    </li>
+    <li>
+      <h2>Time sitting</h2>
+      <p>{{ copy.neglect }}</p>
+    </li>
+    <li>
+      <h2>Who never appears</h2>
+      <p>{{ copy.filters }}</p>
+    </li>
+  </ol>
+</div>
+{% endblock %}

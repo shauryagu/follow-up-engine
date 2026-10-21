@@ -30,6 +30,12 @@ class Candidate:
     reason: str
     amount: float
     sendable: bool
+    view_count: int = 0
+    views_in_hot_window: int = 0
+    days_since_contact: float = 0.0
+    last_view: str | None = None
+    last_reply: str | None = None
+    last_outbound: str | None = None
 
 
 def _parse(ts: str) -> datetime:
@@ -130,6 +136,12 @@ def recommend(conn: sqlite3.Connection, now: str) -> list[Candidate]:
         outbound_times = [ts for ts in (last_sent_event, outbound_from_messages.get(qid)) if ts]
         last_outbound = _last_of(outbound_times)
         view_count = sum(1 for e in events if e["type"] == "quote_viewed")
+        hot_cutoff = now_dt - timedelta(hours=HOT_VIEW_HOURS)
+        views_in_hot_window = sum(
+            1
+            for e in events
+            if e["type"] == "quote_viewed" and _parse(e["timestamp"]) >= hot_cutoff
+        )
         reason = _reason(last_reply, last_view, last_outbound, now_dt)
         last_contact_dt = _last_contact_dt(
             quote["last_contact_at"],
@@ -153,6 +165,12 @@ def recommend(conn: sqlite3.Connection, now: str) -> list[Candidate]:
                 reason=reason,
                 amount=amount,
                 sendable=quote["customer_phone"] not in cooled,
+                view_count=view_count,
+                views_in_hot_window=views_in_hot_window,
+                days_since_contact=days_since_contact,
+                last_view=last_view,
+                last_reply=last_reply,
+                last_outbound=last_outbound,
             )
         )
     candidates.sort(key=lambda c: (-c.score, c.quote_id))

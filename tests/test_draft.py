@@ -50,10 +50,20 @@ def _conn_with(*quotes):
 def test_template_body_lists_open_quotes_primary_first():
     assert first_name("Karen Nguyen") == "Karen"
     body = template_body(**TEMPLATE_KW)
-    assert body == (
-        "Hi Karen, it's Alex following up. Open quotes: Q-1003 ($850), Q-1025 ($850). "
-        "Reason: quiet_open."
-    )
+    assert "Q-1003 ($850)" in body
+    assert body.index("Q-1003") < body.index("Q-1025")
+    assert "following up" in body.lower()
+
+
+def test_template_waiting_on_reply_differs_from_check_back():
+    reply = template_body(**{**TEMPLATE_KW, "reason": "unanswered_reply"})
+    ours = template_body(**{**TEMPLATE_KW, "reason": "quiet_open", "stance": "check_back"})
+    first = template_body(**TEMPLATE_KW)
+    assert "reply" in reply.lower()
+    assert "last note" in ours.lower() or "checking back" in ours.lower()
+    assert reply != ours
+    assert ours != first
+    assert "reply" not in ours.lower()
 
 
 def test_render_v1_complete_none_equals_template():
@@ -116,9 +126,36 @@ def test_prompt_references_prior_contact_not_first_touch():
         **TEMPLATE_KW,
     )
     prompt = captured["prompt"].lower()
-    assert "already" in prompt or "prior" in prompt
+    assert "our own" in prompt or "our last" in prompt or "check back" in prompt
     assert "this is a first follow-up" not in prompt
+    assert "they replied" not in prompt
     assert PHONE not in captured["prompt"]
+
+
+def test_prompt_waiting_on_reply_is_not_check_back():
+    captured = {}
+
+    def complete(prompt):
+        captured["prompt"] = prompt
+        return "Got your note — what works?"
+
+    render_v1(
+        now=NOW,
+        complete=complete,
+        contact={
+            "prior_contact": True,
+            "stance": "waiting_on_us",
+            "last_outbound": "2026-08-08T12:00:00Z",
+            "last_reply": "2026-08-09T12:00:00Z",
+            "last_view": "2026-08-09T00:00:00Z",
+        },
+        **{**TEMPLATE_KW, "reason": "unanswered_reply"},
+    )
+    prompt = captured["prompt"].lower()
+    assert "replied" in prompt
+    assert "waiting on us" in prompt or "have not answered" in prompt
+    assert "this is a first follow-up" not in prompt
+    assert "follow-up on our own" not in prompt
 
 
 def test_on_chunk_receives_text_and_generate_saves_only_after_complete():
@@ -147,8 +184,9 @@ def test_model_failure_does_not_save_and_asks_to_retry():
     def complete(prompt):
         raise RuntimeError("connection reset")
 
-    with pytest.raises(DraftGenerationError, match="try again"):
+    with pytest.raises(DraftGenerationError, match="try again") as caught:
         generate_draft(conn, "Q-1003", NOW, complete=complete)
+    assert "connection reset" in str(caught.value)
     assert conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"] == 0
 
 
@@ -172,7 +210,40 @@ def test_generate_draft_uses_events_as_prior_contact():
         ],
     )
     generate_draft(conn, "Q-1003", NOW, complete=complete)
-    assert "already" in captured["prompt"].lower() or "prior" in captured["prompt"].lower()
+    prompt = captured["prompt"].lower()
+    assert "our own" in prompt or "our last" in prompt or "check back" in prompt
+    assert "this is a first follow-up" not in prompt
+
+
+def test_generate_draft_reply_stance_from_events():
+    captured = {}
+
+    def complete(prompt):
+        captured["prompt"] = prompt
+        return "Got your note."
+
+    conn = _conn_with(_quote())
+    ingest_events(
+        conn,
+        [
+            {
+                "event_id": "e-out",
+                "quote_id": "Q-1003",
+                "type": "message_sent",
+                "timestamp": "2026-08-08T12:00:00Z",
+            },
+            {
+                "event_id": "e-in",
+                "quote_id": "Q-1003",
+                "type": "customer_replied",
+                "timestamp": "2026-08-09T12:00:00Z",
+            },
+        ],
+    )
+    generate_draft(conn, "Q-1003", NOW, reason="unanswered_reply", complete=complete)
+    prompt = captured["prompt"].lower()
+    assert "replied" in prompt
+    assert "this is a first follow-up" not in prompt
 
 
 def test_generate_draft_omits_accepted_sibling():
@@ -202,3 +273,15 @@ def test_generate_draft_omits_accepted_sibling():
         )
     }
     assert quote_ids == {"Q-1003", "Q-1025"}
+
+
+def test_load_env_overrides_stale_shell_key(tmp_path, monkeypatch):
+    import os
+
+    from robby.draft import _load_env
+
+    envfile = tmp_path / ".env"
+    envfile.write_text("BASETEN_API_KEY=from-file\n")
+    monkeypatch.setenv("BASETEN_API_KEY", "stale-shell")
+    _load_env(envfile)
+    assert os.environ["BASETEN_API_KEY"] == "from-file"

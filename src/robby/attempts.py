@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from robby import outbox as outbox_mod
-from robby.draft import render_v1, summarize_contact
+from robby.draft import render_v1, summarize_contact, template_body
 
 COOLDOWN_HOURS = 48
 
@@ -80,6 +80,7 @@ def generate_draft(
     reason: str = "quiet_open",
     complete=None,
     on_chunk=None,
+    use_template: bool = False,
 ) -> dict:
     quote = conn.execute("SELECT * FROM quotes WHERE id = ?", (primary_quote_id,)).fetchone()
     if quote is None or quote["status"] != "open":
@@ -93,15 +94,36 @@ def generate_draft(
         {"id": row["id"], "amount": row["amount"], "status": row["status"]}
         for row in open_rows
     ]
-    event_rows = conn.execute(
-        "SELECT type, timestamp FROM events WHERE quote_id = ? AND timestamp <= ?",
-        (primary_quote_id, now),
-    ).fetchall()
+    event_rows = [
+        {"type": row["type"], "timestamp": row["timestamp"]}
+        for row in conn.execute(
+            "SELECT type, timestamp FROM events WHERE quote_id = ? AND timestamp <= ?",
+            (primary_quote_id, now),
+        )
+    ]
+    for row in conn.execute(
+        """
+        SELECT sent_at FROM messages
+        WHERE customer_phone = ? AND status = 'sent' AND sent_at IS NOT NULL AND sent_at <= ?
+        """,
+        (quote["customer_phone"], now),
+    ):
+        event_rows.append({"type": "message_sent", "timestamp": row["sent_at"]})
     contact = summarize_contact(
         last_contact_at=quote["last_contact_at"],
         events=event_rows,
         now=now,
     )
+    if use_template:
+        mode = contact.get("stance") or reason
+        complete = lambda prompt, m=mode: template_body(
+            customer_name=quote["customer_name"],
+            tech_name=quote["tech_name"],
+            reason=reason,
+            primary_quote_id=primary_quote_id,
+            open_quotes=open_quotes,
+            stance=m,
+        )
     body = render_v1(
         customer_name=quote["customer_name"],
         tech_name=quote["tech_name"],

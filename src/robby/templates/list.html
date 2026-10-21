@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Follow-up queue{% endblock %}
+{% block body %}
+<p class="clock">{{ now_label }} · {{ writer }} · <a href="/ranking?now={{ now | urlencode }}">How ranking works</a></p>
+<h1>Who to follow up</h1>
+<p class="lede">Recommended from open quotes. Review and send, or keep drafting.</p>
+{% if rows %}
+<div class="card">
+  <ol class="queue">
+    {% for row in rows %}
+    <li>
+      <a class="ticket{% if not row.candidate.sendable %} is-hold{% endif %}" href="/quotes/{{ row.quote.id }}?now={{ now | urlencode }}">
+        <span class="ticket-name">{{ row.quote.customer_name }}</span>
+        <span class="ticket-why"><span class="ticket-id">#{{ row.rank }} · {{ row.quote.id }}</span> · {{ row.reason_label }}{% if not row.candidate.sendable %} · waiting on cooldown{% endif %}</span>
+        <span class="ticket-amt">${{ "%.0f"|format(row.quote.amount) }}</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ol>
+</div>
+{% else %}
+<div class="card"><p class="empty">No open quotes to follow up right now.</p></div>
+{% endif %}
+{% endblock %}

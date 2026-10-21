@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}{{ quote.customer_name }} · {{ quote.id }}{% endblock %}
+{% block body %}
+<p><a class="back" href="/?now={{ now | urlencode }}" id="back">Back</a></p>
+<p class="clock">{{ now_label }} · {{ writer }}</p>
+<header class="mast">
+  <h1>{{ quote.customer_name }}</h1>
+  <p class="mast-amt">${{ "%.0f"|format(quote.amount) }}</p>
+  <p class="mast-id">{{ quote.id }} · {{ quote.status }}{% if reason_label %} · {{ reason_label }}{% endif %}</p>
+  <p class="mast-contact">{{ quote.customer_phone }} · tech {{ quote.tech_name }}</p>
+</header>
+{% if why_rank %}
+<section class="card card-pad why-rank">
+  <h2>Why this rank</h2>
+  <p>{{ why_rank }}</p>
+  <p class="meta"><a href="/ranking?now={{ now | urlencode }}">How ranking works</a></p>
+</section>
+{% endif %}
+
+{% if not sendable and open_status %}
+<p class="flash hold" role="status">{{ cooldown_copy }}</p>
+{% endif %}
+
+{% if siblings|length > 1 %}
+<p class="sibs">Open quotes on this number:
+  {% for sib in siblings %}
+    <a href="/quotes/{{ sib.id }}?now={{ now | urlencode }}">{{ sib.id }} (${{ "%.0f"|format(sib.amount) }})</a>{% if not loop.last %} {% endif %}
+  {% endfor %}
+</p>
+{% endif %}
+
+{% if compose and compose.status == "draft" %}
+<section class="leave card card-pad stack">
+  <p>This draft is saved. Leaving?</p>
+  <p class="actions">
+    <a class="btn" href="/?now={{ now | urlencode }}">Keep</a>
+    <form method="post" action="/messages/{{ compose.id }}/discard" onsubmit="return confirmAction(this, 'Discard this draft?')">
+      <input type="hidden" name="now" value="{{ now }}">
+      <input type="hidden" name="quote_id" value="{{ quote.id }}">
+      <input type="hidden" name="confirmed" value="false">
+      <button type="submit">Discard this draft</button>
+    </form>
+    <a class="btn" href="#compose">Stay</a>
+  </p>
+</section>
+{% endif %}
+
+<div class="workspace">
+<section class="card" id="compose">
+  <div class="card-pad stack">
+  {% if compose and compose.status == "draft" %}
+  <form method="post" action="/messages/{{ compose.id }}/edit">
+    <input type="hidden" name="now" value="{{ now }}">
+    <input type="hidden" name="quote_id" value="{{ quote.id }}">
+    <label>Draft
+      <textarea name="body" required>{{ compose.body }}</textarea>
+    </label>
+    <p class="actions"><button type="submit">Save edits</button></p>
+  </form>
+  <form method="post" action="/messages/{{ compose.id }}/send" onsubmit="return confirmAction(this, 'Send this follow-up to the shop outbox?')">
+    <input type="hidden" name="now" value="{{ now }}">
+    <input type="hidden" name="quote_id" value="{{ quote.id }}">
+    <input type="hidden" name="confirmed" value="false">
+    <p class="actions"><button type="submit" class="primary" {% if not sendable %}disabled{% endif %}>Send</button></p>
+  </form>
+  {% elif compose and compose.status == "sent" %}
+  <p class="outbox-mark"><span class="pill sent">In the outbox</span>{% if compose.decision == "approved_with_edits" %} <span class="pill edit">Approved with edits</span>{% elif compose.decision == "approved_as_is" %} <span class="pill">Approved as-is</span>{% endif %}</p>
+  <pre>{{ compose.body }}</pre>
+  <p class="actions"><a class="btn primary" href="/?now={{ now | urlencode }}">Back to quotes</a></p>
+  {% endif %}
+
+  <pre id="stream-preview" hidden></pre>
+
+  {% if open_status %}
+  <form id="generate-form" class="generate" method="post" action="/quotes/{{ quote.id }}/drafts" onsubmit="return startStream(event)">
+    <input type="hidden" name="now" value="{{ now }}">
+    <label class="plain"><input type="checkbox" name="use_template" value="1"> Use template</label>
+    {% if flash and "try again" in flash|lower %}
+    <button type="submit" class="primary" id="generate-btn">Try again</button>
+    {% elif compose and compose.status == "draft" %}
+    <button type="submit" id="generate-btn">Generate another</button>
+    {% else %}
+    <button type="submit" class="primary" id="generate-btn">Generate</button>
+    {% endif %}
+  </form>
+  {% endif %}
+  </div>
+</section>
+
+<div class="rail">
+<section class="card">
+  <div class="card-pad">
+  <h2>Thread</h2>
+  {% if thread %}
+  <ul class="thread">
+    {% for item in thread %}
+    <li>
+      <span class="meta">{{ item.at_label }}</span>
+      <span class="kind">{{ item.kind }}</span>
+      {% if item.kind == "outbox_sent" and item.detail %}
+      <span class="sms">{{ item.detail }}</span>
+      {% elif item.detail and item.detail != "{}" %}
+      — {{ item.detail }}
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>No events yet for this quote.</p>
+  {% endif %}
+  </div>
+</section>
+
+{% if drafts %}
+<section class="card" style="margin-top:1rem">
+  <div class="card-pad">
+  <h2>Drafts for this number</h2>
+  <ul class="drafts">
+    {% for d in drafts %}
+    <li>
+      <a href="/quotes/{{ quote.id }}?now={{ now | urlencode }}&draft={{ d.id }}">{{ d.status }}</a>
+      · {{ d.primary_quote_id }} · {{ d.created_label }}
+    </li>
+    {% endfor %}
+  </ul>
+  </div>
+</section>
+{% endif %}
+</div>
+</div>
+
+<script>
+function confirmAction(form, message) {
+  if (!window.confirm(message)) return false;
+  form.querySelector('[name=confirmed]').value = 'true';
+  return true;
+}
+function startStream(event) {
+  event.preventDefault();
+  var form = event.target;
+  var btn = document.getElementById('generate-btn');
+  if (btn.disabled) return false;
+  btn.disabled = true;
+  var now = form.querySelector('[name=now]').value;
+  var useTemplate = form.querySelector('[name=use_template]').checked ? '1' : '';
+  var quoteId = {{ quote.id | tojson }};
+  var preview = document.getElementById('stream-preview');
+  preview.hidden = false;
+  preview.textContent = '';
+  var url = '/quotes/' + encodeURIComponent(quoteId) + '/draft-stream?now=' + encodeURIComponent(now);
+  if (useTemplate) url += '&use_template=1';
+  var es = new EventSource(url);
+  es.onmessage = function (e) {
+    var data = JSON.parse(e.data);
+    if (data.type === 'chunk') preview.textContent += data.text;
+    if (data.type === 'done') {
+      es.close();
+      window.location = '/quotes/' + encodeURIComponent(quoteId) + '?now=' + encodeURIComponent(now) + '&draft=' + encodeURIComponent(data.message_id);
+    }
+    if (data.type === 'error') {
+      es.close();
+      window.location = '/quotes/' + encodeURIComponent(quoteId) + '?now=' + encodeURIComponent(now) + '&flash=' + encodeURIComponent(data.message);
+    }
+  };
+  es.onerror = function () {
+    es.close();
+    btn.disabled = false;
+  };
+  return false;
+}
+</script>
+{% endblock %}

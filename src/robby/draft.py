@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
+import re
+from pathlib import Path
 from typing import Callable, Iterable
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -9,6 +12,7 @@ RETRY_MESSAGE = "The model couldn't generate a draft. Wait a moment and try agai
 
 CompleteFn = Callable[[str], str]
 ChunkFn = Callable[[str], None]
+log = logging.getLogger(__name__)
 
 
 class DraftGenerationError(Exception):
@@ -16,12 +20,42 @@ class DraftGenerationError(Exception):
         super().__init__(message)
 
 
-def _load_env() -> None:
+def _redact(text: str) -> str:
+    text = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted]", text)
+    return re.sub(r"(?i)(api[_-]?key['\"]?\s*[:=]\s*['\"]?)[^\s'\"]+", r"\1[redacted]", text)
+
+
+def _provider_detail(exc: BaseException) -> str:
+    bits = [type(exc).__name__]
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        bits.append(str(status))
+    msg = str(exc).strip()
+    body = getattr(exc, "body", None)
+    extra = msg
+    if not extra and body is not None:
+        extra = str(body)
+    detail = " ".join(bits)
+    if extra and extra not in detail:
+        detail = f"{detail}: {extra}"
+    return _redact(detail)
+
+
+def _raise_generation_error(exc: BaseException) -> None:
+    detail = _provider_detail(exc)
+    log.exception("draft generation failed: %s", detail)
+    raise DraftGenerationError(f"{RETRY_MESSAGE} ({detail})") from exc
+
+
+ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+
+
+def _load_env(path: Path | None = None) -> None:
     try:
         from dotenv import load_dotenv
     except ImportError:
         return
-    load_dotenv()
+    load_dotenv(path or ENV_PATH, override=True)
 
 
 _load_env()
@@ -45,6 +79,21 @@ def _quote_list(primary_quote_id: str, open_quotes: list[dict]) -> str:
     )
 
 
+def stance_for(*, reason: str, contact: dict | None) -> str:
+    contact = contact or {}
+    if contact.get("stance") in ("waiting_on_us", "check_back", "first_touch"):
+        return contact["stance"]
+    last_reply = contact.get("last_reply")
+    last_outbound = contact.get("last_outbound")
+    if last_reply and (not last_outbound or last_reply > last_outbound):
+        return "waiting_on_us"
+    if contact.get("prior_contact") or last_outbound:
+        return "check_back"
+    if reason == "unanswered_reply":
+        return "waiting_on_us"
+    return "first_touch"
+
+
 def template_body(
     *,
     customer_name: str,
@@ -52,12 +101,22 @@ def template_body(
     reason: str,
     primary_quote_id: str,
     open_quotes: list[dict],
+    stance: str | None = None,
 ) -> str:
     listed = _quote_list(primary_quote_id, open_quotes)
-    return (
-        f"Hi {first_name(customer_name)}, it's {tech_name} following up. "
-        f"Open quotes: {listed}. Reason: {reason}."
-    )
+    given = first_name(customer_name)
+    mode = stance or stance_for(reason=reason, contact=None)
+    if mode == "waiting_on_us":
+        return (
+            f"Hi {given}, it's {tech_name}. Got your reply on {listed}. "
+            "What works to pick this up?"
+        )
+    if mode == "check_back":
+        return (
+            f"Hi {given}, it's {tech_name} checking back on my last note. "
+            f"Open quotes: {listed}."
+        )
+    return f"Hi {given}, it's {tech_name} following up. Open quotes: {listed}."
 
 
 def summarize_contact(
@@ -79,10 +138,18 @@ def summarize_contact(
         elif kind == "quote_viewed":
             last_view = ts if last_view is None or ts > last_view else last_view
     book = last_contact_at if last_contact_at and last_contact_at <= now else None
-    prior = bool(book or last_outbound)
+    outbound = last_outbound or book
+    prior = bool(outbound)
+    if last_reply and (not outbound or last_reply > outbound):
+        stance = "waiting_on_us"
+    elif prior:
+        stance = "check_back"
+    else:
+        stance = "first_touch"
     return {
         "prior_contact": prior,
-        "last_outbound": last_outbound or book,
+        "stance": stance,
+        "last_outbound": outbound,
         "last_reply": last_reply,
         "last_view": last_view,
     }
@@ -101,13 +168,20 @@ def _build_prompt(
     listed = _quote_list(primary_quote_id, open_quotes)
     given = first_name(customer_name)
     contact = contact or {}
-    prior = bool(contact.get("prior_contact"))
-    if prior:
+    stance = stance_for(reason=reason, contact=contact)
+    if stance == "waiting_on_us":
         touch = (
-            "You already contacted this homeowner "
-            f"(last outbound: {contact.get('last_outbound')}). "
-            f"Last view: {contact.get('last_view')}. Last reply: {contact.get('last_reply')}. "
-            "Acknowledge that prior contact. Do not write as if you have never spoken."
+            "They replied and we have not answered (waiting on us). "
+            f"Last reply: {contact.get('last_reply')}. Last outbound: {contact.get('last_outbound')}. "
+            "Acknowledge the reply. Ask one clear next step. "
+            "Do not write as if this is a cold check-in."
+        )
+    elif stance == "check_back":
+        touch = (
+            "We last messaged them and they have not replied. "
+            "This is a follow-up on our own note. Check back on that last note. "
+            f"Last outbound: {contact.get('last_outbound')}. Last view: {contact.get('last_view')}. "
+            "Do not say they wrote back. Keep it light."
         )
     else:
         touch = (
@@ -156,7 +230,7 @@ def _complete_via_baseten(prompt: str, on_chunk: ChunkFn | None = None) -> str:
     except DraftGenerationError:
         raise
     except Exception as exc:
-        raise DraftGenerationError() from exc
+        _raise_generation_error(exc)
 
 
 def render_v1(
@@ -177,6 +251,7 @@ def render_v1(
         reason=reason,
         primary_quote_id=primary_quote_id,
         open_quotes=open_quotes,
+        stance=stance_for(reason=reason, contact=contact),
     )
     prompt = _build_prompt(
         customer_name=customer_name,
@@ -197,7 +272,7 @@ def render_v1(
         except DraftGenerationError:
             raise
         except Exception as exc:
-            raise DraftGenerationError() from exc
+            _raise_generation_error(exc)
         stripped = "" if text is None else str(text).strip()
         if stripped and on_chunk:
             on_chunk(stripped)

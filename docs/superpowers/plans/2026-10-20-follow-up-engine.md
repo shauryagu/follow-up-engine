@@ -190,41 +190,274 @@ CREATE TABLE IF NOT EXISTS outbox (
 
 ## Task 2: Policy
 
-**Deepen before dispatch:** exact `Candidate` dataclass, fold queries, four HVAC contract fixtures with concrete amounts/timestamps, `sendable` via `messages.sent_at` (table exists, may be empty).
+**Where this fits:** Pure ranking over Task 1 tables plus `messages.sent_at` from Task 3. Do not edit `attempts.py`, `outbox.py`, or `draft.py`. Import `COOLDOWN_HOURS` from `robby.attempts`.
 
-**Depends on:** Task 1. **Unblocks:** Task 5 list. **Parallel with:** Task 3 (not in this session).
+**Files:** `src/robby/policy.py`, `tests/test_policy.py` only.
 
-Create `policy.py`. `recommend(conn, now) -> list[Candidate]` with `quote_id`, `customer_phone`, `score`, `reason`, `amount`, `sendable`. Knobs in one module. Tests: four contract fixtures; cooldown sets `sendable=False` but quote still appears; events after `now` ignored.
+**Knobs (in `policy.py`):**
+
+```python
+HOT_VIEW_HOURS = 48
+URGENCY_REPLY = 1.0
+URGENCY_HOT_VIEW = 0.6
+URGENCY_QUIET = 0.25
+NEGLECT_DAYS = 7
+VIEW_COUNT_EPS = 0.02
+```
+
+**Score:** `log1p(amount) * urgency * (1 + days_since_contact / NEGLECT_DAYS) * (1 + VIEW_COUNT_EPS * log1p(view_count))`
+
+View-count epsilon keeps 6 views above 1 view without letting a hot view beat an unanswered reply at the same amount/age.
+
+**Reason** (dominant term, not the epsilon): `unanswered_reply` if last `customer_replied` (timestamp <= now) is after last outbound or there is no outbound; else `hot_view` if last `quote_viewed` <= now is within `HOT_VIEW_HOURS` of now **and** that view is after last outbound (or no outbound); else `quiet_open`.
+
+**Last outbound** for a quote: max of `events.type='message_sent'` for that `quote_id` with `timestamp<=now`, and `messages.sent_at` where `status='sent'` and the quote is in `message_quotes` for that message.
+
+**Last contact** for neglect: max of `quotes.last_contact_at`, last outbound, clipped to now; if none, `created_at`. `days_since_contact` = (now − last_contact) in days, float.
+
+**Filters:** only `quotes.status='open'`. Do not drop cooldown phones.
+
+**sendable:** False if that `customer_phone` has a `messages` row `status='sent'` with `sent_at` within `COOLDOWN_HOURS` before `now`. Else True.
+
+**API:**
+
+```python
+@dataclass(frozen=True)
+class Candidate:
+    quote_id: str
+    customer_phone: str
+    score: float
+    reason: str  # unanswered_reply | hot_view | quiet_open
+    amount: float
+    sendable: bool
+
+def default_now(conn) -> str:  # max(events.timestamp); if no events, raise
+def recommend(conn, now: str) -> list[Candidate]:  # sort score desc, then quote_id asc
+```
+
+Ignore events with `timestamp > now`.
+
+**Tests (TDD, in-memory, synthetic quotes — do not require the seed file):**
+
+1. Unanswered reply beats same-size hot view: two open quotes amount=5000, created and last_contact `2026-08-01T00:00:00Z`, now=`2026-08-02T00:00:00Z`. A has `customer_replied` at `2026-08-01T20:00:00Z`. B has `quote_viewed` at `2026-08-01T20:00:00Z`. A's score > B's; reasons `unanswered_reply` vs `hot_view`.
+2. Two-week neglected $20000 quiet beats same-day $400 hot view: now=`2026-08-15T00:00:00Z`. A amount 20000, created/last_contact `2026-08-01T00:00:00Z`, no events. B amount 400, created `2026-08-15T00:00:00Z`, viewed `2026-08-15T00:00:00Z`. A ranks first.
+3. Same-day $20000 hot view beats two-week neglected $400 quiet: invert amounts on fixture 2.
+4. View after `now` does not count: quote with only `quote_viewed` at `2026-08-16T00:00:00Z`, now=`2026-08-15T00:00:00Z` → reason `quiet_open`.
+5. Cooldown: insert a `messages` sent row for B's phone at `now`; B still appears with `sendable=False`; A `sendable=True` if different phone.
+6. `recommend` sorts by score descending.
+
+**Out of scope:** draft.py, HTTP, README, LLM.
+
+**Done when:** `pytest tests/test_policy.py tests/test_ingest.py tests/test_attempts.py` pass; committed.
 
 ---
 
 ## Task 3: Outbox + attempts
 
-**Deepen before dispatch:** exception types, `confirmed: bool` on send/discard, crash test (outbox row + message still `draft`), phone-level cooldown using seed pair Q-1003/Q-1025 (Karen Nguyen, +19175552003).
+**Where this fits:** Scored guts. Task 1 left empty `messages`/`outbox` tables. This task writes them. Task 4 will replace the placeholder body; keep body construction as a private helper in `attempts.py` (do not add `draft.py`). Task 2 can import nothing from here except that `sent_at` rows will exist.
 
-**Depends on:** Task 1. **Unblocks:** Task 4, Task 5 compose. **Parallel with:** Task 2 (not in this session).
+**Files:** `src/robby/outbox.py`, `src/robby/attempts.py`, `tests/test_outbox.py`, `tests/test_attempts.py`
 
-Send path: confirm → guards → outbox lookup-or-enqueue → read-back → `sent` or `failed`. Never write `sending`. Generate draft always INSERT.
+**Constants:** `COOLDOWN_HOURS = 48` in `attempts.py`. `now` is an ISO-8601 string; parse with `datetime.fromisoformat(now.replace("Z", "+00:00"))`. Do not use wall clock.
+
+**Outbox API (`outbox.py`):**
+
+```python
+def enqueue(conn, *, idempotency_key: str, payload: dict) -> None:
+    # INSERT OR IGNORE. payload stored as JSON. New rows get uuid4 id and created_at=now from payload? 
+    # Use payload["created_at"] if present else the caller passes created_at.
+```
+
+Caller passes `created_at` inside send via a `created_at` argument:
+
+```python
+def enqueue(conn, *, idempotency_key: str, payload: dict, created_at: str) -> None: ...
+def get_by_key(conn, idempotency_key: str) -> dict | None:
+    # dict with id, idempotency_key, payload (parsed dict), created_at
+```
+
+**Attempts API (`attempts.py`):**
+
+```python
+class SendRejected(Exception):
+    def __init__(self, code: str):
+        self.code = code  # "cooldown" | "not_open" | "illegal_status"
+
+def generate_draft(conn, primary_quote_id: str, now: str, *, reason: str = "quiet_open") -> dict: ...
+def edit_draft(conn, message_id: str, body: str, now: str) -> dict: ...
+def send_attempt(conn, message_id: str, *, confirmed: bool, now: str,
+                 enqueue=None, get_by_key=None) -> dict: ...
+def retry_attempt(conn, message_id: str, *, confirmed: bool, now: str,
+                  enqueue=None, get_by_key=None) -> dict: ...
+def discard_attempt(conn, message_id: str, *, confirmed: bool, now: str) -> dict: ...
+```
+
+Returned `dict` keys: `id`, `customer_phone`, `primary_quote_id`, `body`, `reason`, `status`, `idempotency_key`, `outbox_id`, `decision`, `created_at`, `updated_at`, `sent_at`.
+
+`enqueue`/`get_by_key` default to `outbox.enqueue` / `outbox.get_by_key`. Hooks exist so tests can force verify-miss without mocking sqlite.
+
+**generate_draft**
+- Always INSERT a new `messages` row (`id` and `idempotency_key` = uuid4). Never resume.
+- Primary quote must exist. If its `status != 'open'`, raise `SendRejected("not_open")`.
+- Snapshot **all open quotes with the same `customer_phone`** into `message_quotes` (including primary).
+- Placeholder body (Task 4 will replace): comma-separated `"{id} (${amount:g})"` for those quotes, primary first, then other ids sorted. Example: `Q-1003 ($850), Q-1025 ($850)`.
+- Insert revision version=1, author=`engine`, body=that placeholder.
+- `status='draft'`, `decision='pending'`, timestamps=`now`.
+
+**edit_draft**
+- Only if `status=='draft'`; else raise `SendRejected("illegal_status")`.
+- Update `body`, `updated_at`; append next revision author=`human`.
+
+**discard_attempt**
+- `confirmed=False`: return row unchanged (still draft/failed).
+- `confirmed=True` and status in `draft`|`failed`: set `cancelled`, `updated_at=now`.
+- Other statuses: raise `SendRejected("illegal_status")`.
+
+**send_attempt / retry_attempt**
+`retry_attempt` is `send_attempt` allowed from `failed` only. `send_attempt` allowed from `draft` or `failed` (retry can just call send_attempt).
+
+1. `confirmed=False`: return unchanged, no outbox write.
+2. Status not `draft` or `failed`: raise `SendRejected("illegal_status")`.
+3. Load primary quote. Missing or `status != 'open'`: raise `SendRejected("not_open")`. Message stays `draft`/`failed`.
+4. Cooldown: if another row with the same `customer_phone`, `status='sent'`, and `sent_at` within 48 hours **before** `now` (difference < 48h), raise `SendRejected("cooldown")`. This message’s own row does not count (it is not sent).
+5. `row = get_by_key(idempotency_key)`. If hit: this is crash recovery — set `status='sent'`, `outbox_id=row["id"]`, `sent_at=now`, `updated_at=now`, `decision` = `approved_as_is` if `body` equals revision v1 else `approved_with_edits`. Never insert a second outbox row.
+6. Else `enqueue(...)` with payload JSON `{customer_phone, body, quote_ids, reason, message_id}` (`quote_ids` from `message_quotes`, primary first).
+7. `row = get_by_key(...)`. If missing: set `status='failed'`, `updated_at=now`, return. If present: same sent fields as step 5.
+8. **Never** write status `sending`.
+
+**Outbox payload `quote_ids`:** list of quote ids from `message_quotes`, primary first.
+
+### Tests (TDD: write first, watch fail, then implement)
+
+**test_outbox.py**
+1. enqueue then get_by_key returns the payload.
+2. enqueue twice with the same key → one row; get_by_key still works.
+
+**test_attempts.py** (in-memory db; insert quotes with `ingest_quotes`, do not need full seed except where noted)
+1. Unconfirmed send does not enqueue and leaves `status='draft'`.
+2. Unconfirmed discard leaves `status='draft'`.
+3. Verify miss: pass `get_by_key` that always returns None after a real enqueue (or a fake get_by_key) → `status='failed'`; retry with real outbox and same message → `sent` and **one** outbox row.
+4. Crash recovery: insert an outbox row for the draft’s `idempotency_key` while message is still `draft`; `send_attempt(confirmed=True)` → `sent`, still one outbox row.
+5. Phone cooldown: two open quotes, same phone `+19175552003`, ids `Q-1003` and `Q-1025` (minimal rows: names Karen Nguyen, amount 850, status open, created_at `2026-08-01T00:00:00Z`). Send on a Q-1003 draft at `now=2026-08-10T00:00:00Z` → sent. `generate_draft` on Q-1025 still works. `send_attempt` on that new draft at the same `now` raises `SendRejected("cooldown")`. `message_quotes` on the Q-1025 draft includes both Q-1003 and Q-1025.
+6. `generate_draft` twice on the same primary → two `draft` rows (different ids).
+7. Primary quote `accepted` or `dismissed`: `generate_draft` and `send_attempt` raise `SendRejected("not_open")`. For send, insert an open quote, generate draft, then UPDATE quote status to accepted, then send.
+8. Confirmed discard of a draft → `cancelled`.
+9. After send, `decision` is `approved_as_is` if never edited; after `edit_draft`, send → `approved_with_edits`.
+10. No row in `messages` ever has `status='sending'` (assert after send/crash paths).
+
+**Out of scope:** `draft.py` templates, `policy.py`, HTTP, README, Docker.
+
+**Done when:** `pytest tests/test_outbox.py tests/test_attempts.py tests/test_ingest.py` all pass; committed on `feature/follow-up-engine`.
 
 ---
 
-## Task 4: Draft template + revisions
+## Task 4: Draft v1 (template + DeepSeek)
 
-**Deepen before dispatch:** exact template string, first-name split, sibling listing format.
+**Where this fits:** Replace `_placeholder_body` in `attempts.generate_draft` with `draft.render_v1`. Do not edit `policy.py`. Existing attempt tests must keep passing (placeholder format may change — **update** `tests/test_attempts.py` only if a test asserted the old comma-separated body string; prefer not to couple those tests to copy).
 
-**Depends on:** Task 3 (`generate_draft` / revisions). **Unblocks:** Task 5 compose body.
+**Provider (user-mandated, not SpaceXAI):** Baseten OpenAI-compatible API.
 
-v1 lists every open quote on the phone. Accepted sibling omitted. Two edits → three revisions. Send copies final body into outbox payload.
+- `base_url`: `https://inference.baseten.co/v1`
+- `model`: `deepseek-ai/DeepSeek-V4.1-Flash-1017`
+- Env: `BASETEN_API_KEY` (required to call the model). Optional `BASETEN_BASE_URL` defaulting to the URL above.
+- **Never hardcode an API key.** Never commit `.env`.
+- Completions are **non-streaming** (`stream=False`). `max_tokens=400`, `temperature=0.4`.
+- If `BASETEN_API_KEY` is unset or the `complete` hook is None, use the template. Tests never hit the network.
+
+**Files:** `src/robby/draft.py`, `tests/test_draft.py`, hook in `src/robby/attempts.py`, `pyproject.toml` (`openai` dependency), `.env.example` (`BASETEN_API_KEY=` and `BASETEN_BASE_URL=https://inference.baseten.co/v1`), README.md section **LLM drafts** (signup/billing/key — no secrets).
+
+**API:**
+
+```python
+MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+DEFAULT_BASE_URL = "https://inference.baseten.co/v1"
+
+def first_name(customer_name: str) -> str:  # first token
+def template_body(*, customer_name: str, tech_name: str, reason: str, primary_quote_id: str, open_quotes: list[dict]) -> str: ...
+def render_v1(*, customer_name: str, tech_name: str, reason: str, primary_quote_id: str, open_quotes: list[dict], now: str, complete=None) -> str: ...
+```
+
+`open_quotes` items have at least `id`, `amount`, `status`. Template lists **all** of them (caller already filtered to open), primary first then other ids sorted, format:
+
+```
+Hi {first_name}, it's {tech} following up. Open quotes: Q-1003 ($850), Q-1025 ($850). Reason: {reason}.
+```
+
+`complete(prompt: str) -> str` if provided is used instead of the HTTP client. `render_v1` uses `complete` when not None; else env client; else template. Empty/whitespace LLM output falls back to template.
+
+**attempts.generate_draft:** build `open_quotes` as now, then `body = render_v1(...)`. Add optional `complete=` passed through. Default `complete=None`.
+
+**README LLM drafts section (this task, not Task 6):**
+1. Create a Baseten account and add billing / payment.
+2. Create an API key.
+3. `export BASETEN_API_KEY=...` (or gitignored `.env`).
+4. Model id and base URL as above.
+5. Without a key, drafts use the template.
+
+**Tests (TDD, no network):**
+1. `template_body` includes every open quote id and amounts, primary first; first name from `Karen Nguyen` is `Karen`.
+2. `render_v1` with `complete=None` equals template.
+3. `render_v1` with `complete=lambda prompt: "LLM SMS"` returns `LLM SMS`.
+4. `complete=lambda prompt: "  "` falls back to template.
+5. `generate_draft(..., complete=lambda prompt: "LLM SMS")` stores body `LLM SMS` as revision v1.
+6. Accepted sibling is omitted (still generate_draft's snapshot — two open + one accepted on same phone → body/template lists two).
+
+**Out of scope:** policy, HTTP UI, streaming in the UI, real API calls in CI.
+
+**Done when:** `pytest tests/test_draft.py tests/test_attempts.py tests/test_ingest.py` pass; no secrets in git; committed.
 
 ---
 
 ## Task 5: Localhost workspace
 
-**Deepen before dispatch:** FastAPI vs stdlib http.server, route list, confirm modal behavior. After Tasks 2–4 exist.
+**Where this fits:** Technician critical path on top of T1–T4. No new policy. Every mutating button calls `generate_draft` / `edit_draft` / `send_attempt` / `discard_attempt`. Streaming uses `on_chunk`; save still happens only when `generate_draft` returns.
 
-**Depends on:** Tasks 2, 3, 4.
+**Stack:** FastAPI + Jinja2 + a small amount of vanilla JS (SSE + confirm dialogs). `uvicorn`. Localhost. No auth.
 
-List, quote detail, drafts for that phone, generate, compose, confirms, post-send Back | Generate another.
+**Files:** `src/robby/app.py`, `src/robby/templates/base.html`, `list.html`, `quote.html`, `tests/test_app.py`. Add `fastapi`, `jinja2`, `uvicorn`, `httpx` in `pyproject.toml`.
+
+**Boot:** `connect(ROBBY_DB or data/robby.sqlite)`. If `quotes` is empty, `ingest_seed` from repo-root `quotes.json` / `events.jsonl`. `now` = query `?now=` or `default_now(conn)`.
+
+**Awareness copy (verbatim):**
+- Banner on every page: `Sends write to the shop outbox. Nothing goes to the customer's phone in this demo.`
+- Reasons: `unanswered_reply` → `They replied — waiting on us`; `hot_view` → `Opened the quote in the last 48 hours`; `quiet_open` → `Open, no recent engagement`.
+- Cooldown: `You already followed up this number. You can still draft. Send unlocks after 48 hours.`
+- Writer: `Written with AI` if `BASETEN_API_KEY` is set, else `Template (no API key)`.
+- After send: `In the outbox` (never “texted”).
+- Show labeled `now` on the list.
+
+**Fail-safe:**
+- Send / discard require `confirmed=true` (JS confirm, then POST). Unconfirmed is not sent from the UI.
+- Leave-with-draft: Keep (default, just go to list) / Discard this draft / Stay.
+- Generate disabled while a stream is open. Model error: flash `The model couldn't generate a draft. Wait a moment and try again.` No new row.
+- Send disabled when not `sendable` or quote not open. Generate still enabled on cooldown.
+- One primary button: Generate or Send or Try again.
+
+**Customizability:** textarea edit; Generate another (new row); checkbox `Use template` (`complete` forced to template_body path — pass a complete hook that ignores the model, or a `use_template=1` flag that calls `render` with empty key). Implement `use_template` query/form: `generate_draft(..., complete=lambda prompt: template_body(...))` using quote fields already loaded.
+
+**Routes:**
+- `GET /` list
+- `GET /quotes/{quote_id}` workspace (customer, sibling open quotes, thread, drafts for **phone**, compose if `draft_id`)
+- `GET /quotes/{quote_id}/draft-stream` SSE: events `chunk` / `done` (message_id) / `error` (retry text). Query `use_template=1` optional.
+- `POST /messages/{message_id}/edit` body= textarea, redirect workspace
+- `POST /messages/{message_id}/send` confirmed=true, redirect workspace
+- `POST /messages/{message_id}/discard` confirmed=true, redirect workspace
+- `GET /` is Back
+
+**Thread:** events for the quote with `timestamp<=now` plus `messages` status=`sent` for that phone.
+
+**Tests (TestClient, no network — conftest already strips API key):**
+1. GET `/` lists open quotes; accepted/dismissed absent; reason labels appear.
+2. GET quote page shows customer name and Generate.
+3. POST generate via draft-stream or a test-only POST `/quotes/{id}/drafts` that calls `generate_draft` without SSE — prefer a synchronous `POST /quotes/{id}/drafts` used by tests and as noscript fallback; JS uses SSE. After POST, a `messages` row exists and page shows the body.
+4. Send without confirmed does not enqueue; send with confirmed=true creates outbox row; page says `In the outbox`.
+5. Cooldown: after send, quote page still has Generate, Send is disabled / cooldown copy shown.
+6. Discard confirmed cancels draft.
+7. Model error: monkeypatch `generate_draft` to raise `DraftGenerationError`; stream/POST returns the retry sentence; still zero new messages if we count before/after.
+
+**Done when:** `pytest tests/` passes; `uvicorn robby.app:app` serves the path on localhost.
+
+---
 
 ---
 
