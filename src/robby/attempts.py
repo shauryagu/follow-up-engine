@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from robby import outbox as outbox_mod
+from robby.draft import render_v1
 
 COOLDOWN_HOURS = 48
 
@@ -43,13 +44,6 @@ def _load_message(conn: sqlite3.Connection, message_id: str) -> dict:
     return _as_message(row)
 
 
-def _placeholder_body(primary_quote_id: str, quotes: list) -> str:
-    amounts = {row["id"]: row["amount"] for row in quotes}
-    others = sorted(qid for qid in amounts if qid != primary_quote_id)
-    ordered = [primary_quote_id, *others]
-    return ", ".join(f"{qid} (${amounts[qid]:g})" for qid in ordered)
-
-
 def _quote_ids(conn: sqlite3.Connection, message_id: str, primary_quote_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT quote_id FROM message_quotes WHERE message_id = ?",
@@ -84,16 +78,29 @@ def generate_draft(
     now: str,
     *,
     reason: str = "quiet_open",
+    complete=None,
 ) -> dict:
     quote = conn.execute("SELECT * FROM quotes WHERE id = ?", (primary_quote_id,)).fetchone()
     if quote is None or quote["status"] != "open":
         raise SendRejected("not_open")
 
-    open_quotes = conn.execute(
-        "SELECT id, amount FROM quotes WHERE customer_phone = ? AND status = 'open'",
+    open_rows = conn.execute(
+        "SELECT id, amount, status FROM quotes WHERE customer_phone = ? AND status = 'open'",
         (quote["customer_phone"],),
     ).fetchall()
-    body = _placeholder_body(primary_quote_id, open_quotes)
+    open_quotes = [
+        {"id": row["id"], "amount": row["amount"], "status": row["status"]}
+        for row in open_rows
+    ]
+    body = render_v1(
+        customer_name=quote["customer_name"],
+        tech_name=quote["tech_name"],
+        reason=reason,
+        primary_quote_id=primary_quote_id,
+        open_quotes=open_quotes,
+        now=now,
+        complete=complete,
+    )
     message_id = str(uuid.uuid4())
     idempotency_key = str(uuid.uuid4())
     conn.execute(
